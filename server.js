@@ -1,5 +1,5 @@
 // ============================================
-// ExpressAutoShine — Stripe Checkout Backen
+// ExpressAutoShine — Stripe Checkout Backend
 // ============================================
 // This server creates Stripe Checkout Sessions
 // so customers can pay for their detailing bookings.
