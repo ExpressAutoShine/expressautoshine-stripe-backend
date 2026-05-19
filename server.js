@@ -20,11 +20,53 @@ const express = require('express');
 const cors = require('cors');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const { Resend } = require('resend');
+const Database = require('better-sqlite3');
+const path = require('path');
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// ===== SQLITE DATABASE SETUP =====
+// DB_PATH env var lets you point to a Render persistent disk (e.g. /var/data/bookings.db)
+const dbPath = process.env.DB_PATH || path.join(__dirname, 'bookings.db');
+const db = new Database(dbPath);
+
+// Enable WAL mode for better concurrent read performance
+db.pragma('journal_mode = WAL');
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS bookings (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    booking_date    TEXT    NOT NULL,
+    start_time      TEXT    NOT NULL,
+    start_minutes   INTEGER NOT NULL,
+    end_minutes     INTEGER NOT NULL,
+    duration_minutes INTEGER NOT NULL,
+    customer_first  TEXT,
+    customer_last   TEXT,
+    customer_email  TEXT,
+    customer_phone  TEXT,
+    address         TEXT,
+    service         TEXT,
+    svc_key         TEXT,
+    pkg_key         TEXT,
+    size_key        TEXT,
+    vehicle         TEXT,
+    addons          TEXT,
+    total_paid_cents INTEGER,
+    stripe_session_id   TEXT UNIQUE,
+    stripe_payment_intent TEXT,
+    created_at      TEXT DEFAULT (datetime('now'))
+  )
+`);
+
+// Index for fast availability lookups
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_bookings_date_time
+  ON bookings (booking_date, start_minutes, end_minutes)
+`);
 
 // ===== STRIPE WEBHOOK (must be BEFORE express.json() middleware) =====
 // Stripe requires the raw body to verify webhook signatures
@@ -60,6 +102,69 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         console.log('Customer confirmation email sent for session:', session.id);
       } catch (emailErr) {
         console.error('Failed to send customer confirmation email:', emailErr.message);
+      }
+
+      // Save booking and block the time slot (race-condition-safe)
+      try {
+        const m = session.metadata || {};
+        const startMin = parseTimeToMinutes(m.time);
+
+        if (startMin !== null && m.date) {
+          const addonNames = m.addons ? m.addons.split(', ').filter(a => a.trim()) : [];
+          const { endMinutes, durationMinutes } = calculateBlockedEndMinutes(
+            startMin, m.svcKey || '', m.pkgKey || '', m.sizeKey || '', addonNames
+          );
+
+          const result = insertBookingIfAvailable({
+            booking_date: m.date,
+            start_time: m.time,
+            start_minutes: startMin,
+            end_minutes: endMinutes,
+            duration_minutes: durationMinutes,
+            customer_first: m.firstName || '',
+            customer_last: m.lastName || '',
+            customer_email: m.email || session.customer_email || '',
+            customer_phone: m.phone || '',
+            address: m.address || '',
+            service: m.service || '',
+            svc_key: m.svcKey || '',
+            pkg_key: m.pkgKey || '',
+            size_key: m.sizeKey || '',
+            vehicle: m.vehicle || '',
+            addons: m.addons || '',
+            total_paid_cents: session.amount_total || 0,
+            stripe_session_id: session.id,
+            stripe_payment_intent: session.payment_intent || ''
+          });
+
+          if (result.success) {
+            console.log(`Booking saved: ${m.date} ${m.time} — blocked until ${minutesToTimeStr(endMinutes)}`);
+          } else {
+            // Slot conflict: payment went through but slot was taken by another booking
+            console.error(`SCHEDULE CONFLICT: ${m.date} ${m.time} overlaps with booking #${result.conflict.id}`);
+            // Alert the owner so they can manually resolve
+            try {
+              await resend.emails.send({
+                from: 'ExpressAutoShine <bookings@expressautoshine.ca>',
+                to: ['Info@expressautoshine.com'],
+                subject: `⚠️ SCHEDULE CONFLICT — ${m.firstName} ${m.lastName} on ${m.date}`,
+                html: `<p><strong>A customer paid but their time slot was already booked.</strong></p>
+                       <p>Customer: ${m.firstName} ${m.lastName} (${m.email})</p>
+                       <p>Requested: ${m.date} at ${m.time}</p>
+                       <p>Service: ${m.service}</p>
+                       <p>Conflicts with existing booking #${result.conflict.id} at ${result.conflict.start_time}</p>
+                       <p>Please contact the customer to reschedule or refund.</p>`
+              });
+            } catch (alertErr) {
+              console.error('Failed to send conflict alert email:', alertErr.message);
+            }
+          }
+        } else {
+          console.error('Could not parse booking date/time from metadata — booking not saved');
+        }
+      } catch (dbErr) {
+        // Log but don't fail the webhook — payment and emails already succeeded
+        console.error('Failed to save booking to database:', dbErr.message);
       }
     }
   }
@@ -220,6 +325,103 @@ const ADDON_PRICES = {
 const GST = 0.05;
 const QST = 0.09975;
 
+// ===== SERVICE DURATIONS (estimated minutes per service/package/size) =====
+// Adjust these if real job times differ — they control schedule blocking
+const SERVICE_DURATIONS = {
+  exterior:    { maintenance: { sedan: 90,  suv: 105, truck: 120 }, premium:     { sedan: 120, suv: 150, truck: 180 } },
+  interior:    { maintenance: { sedan: 90,  suv: 105, truck: 120 }, premium:     { sedan: 150, suv: 180, truck: 210 } },
+  full:        { basic:       { sedan: 150, suv: 180, truck: 210 }, premium:     { sedan: 210, suv: 240, truck: 270 }, signature: { sedan: 270, suv: 300, truck: 330 } },
+  correction:  { enhancement: { sedan: 180, suv: 210, truck: 240 }, correction:  { sedan: 300, suv: 360, truck: 420 } },
+  ceramic:     { '1year':     { sedan: 240, suv: 270, truck: 300 }, '3year':     { sedan: 300, suv: 360, truck: 420 }, '8year': { sedan: 360, suv: 420, truck: 480 } }
+};
+
+// Add-on durations (estimated additional minutes per add-on)
+const ADDON_DURATIONS = {
+  'Engine Bay Detail': 30, 'Windshield Water Repellent': 15, 'Tree Sap Removal': 30,
+  'Headlight Restoration': 45, 'Gloss Enhancement Polish': 60, "Kid's Car Seat": 15,
+  'Salt Removal': 20, 'Pet Hair Removal': 30, 'Ozone Odor Treatment': 30,
+  'Interior Protection Package': 60, 'Interior Refresh Detail': 45,
+  'Glass Ceramic Coating': 45, 'Wheel Ceramic Coating': 45, 'Glass Coating': 30
+};
+
+// ===== TIME HELPER FUNCTIONS =====
+
+// "10:00 AM" → 600, "2:30 PM" → 870
+function parseTimeToMinutes(timeStr) {
+  const match = timeStr.match(/(\d+):(\d+)\s*(AM|PM)/i);
+  if (!match) return null;
+  let hours = parseInt(match[1]);
+  const minutes = parseInt(match[2]);
+  const period = match[3].toUpperCase();
+  if (period === 'PM' && hours !== 12) hours += 12;
+  if (period === 'AM' && hours === 12) hours = 0;
+  return hours * 60 + minutes;
+}
+
+// 870 → "2:30 PM"
+function minutesToTimeStr(mins) {
+  let h = Math.floor(mins / 60);
+  const m = mins % 60;
+  const period = h >= 12 ? 'PM' : 'AM';
+  if (h > 12) h -= 12;
+  if (h === 0) h = 12;
+  return `${h}:${String(m).padStart(2, '0')} ${period}`;
+}
+
+// Calculate total service time, then round UP to nearest 30min, then add 60min buffer
+function calculateBlockedEndMinutes(startMinutes, svcKey, pkgKey, sizeKey, addonNames) {
+  // Base service duration
+  let totalMin = 120; // fallback: 2 hours if lookup fails
+  if (SERVICE_DURATIONS[svcKey] && SERVICE_DURATIONS[svcKey][pkgKey] && SERVICE_DURATIONS[svcKey][pkgKey][sizeKey]) {
+    totalMin = SERVICE_DURATIONS[svcKey][pkgKey][sizeKey];
+  }
+
+  // Add add-on durations
+  if (addonNames && addonNames.length > 0) {
+    for (const name of addonNames) {
+      totalMin += ADDON_DURATIONS[name] || 0;
+    }
+  }
+
+  // Round UP to nearest 30-minute slot
+  const rounded = Math.ceil(totalMin / 30) * 30;
+
+  // Add 1-hour (60 min) buffer
+  const blocked = rounded + 60;
+
+  return { endMinutes: startMinutes + blocked, durationMinutes: totalMin };
+}
+
+// ===== BOOKING DATABASE HELPERS =====
+
+// Race-condition-safe: runs inside a SQLite transaction (serialized writes)
+const insertBookingIfAvailable = db.transaction((data) => {
+  // Check for overlapping bookings on the same date
+  const conflict = db.prepare(
+    'SELECT id, start_time FROM bookings WHERE booking_date = ? AND start_minutes < ? AND end_minutes > ?'
+  ).get(data.booking_date, data.end_minutes, data.start_minutes);
+
+  if (conflict) {
+    return { success: false, conflict };
+  }
+
+  db.prepare(`
+    INSERT INTO bookings (
+      booking_date, start_time, start_minutes, end_minutes, duration_minutes,
+      customer_first, customer_last, customer_email, customer_phone,
+      address, service, svc_key, pkg_key, size_key, vehicle, addons,
+      total_paid_cents, stripe_session_id, stripe_payment_intent
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    data.booking_date, data.start_time, data.start_minutes, data.end_minutes, data.duration_minutes,
+    data.customer_first, data.customer_last, data.customer_email, data.customer_phone,
+    data.address, data.service, data.svc_key, data.pkg_key, data.size_key, data.vehicle, data.addons,
+    data.total_paid_cents, data.stripe_session_id, data.stripe_payment_intent
+  );
+
+  return { success: true };
+});
+
 // ===== ROUTES =====
 
 // Health check
@@ -302,6 +504,9 @@ app.post('/create-checkout-session', async (req, res) => {
       customer_email: email,
       metadata: {
         firstName, lastName, phone, email,
+        svcKey: svcKey || '',
+        pkgKey: pkgKey || '',
+        sizeKey: sizeKey || '',
         service: service || `${svcKey} - ${pkgKey}`,
         vehicle: vehicle || '',
         date: date || '',
@@ -340,6 +545,46 @@ app.get('/session/:id', async (req, res) => {
     });
   } catch (error) {
     res.status(404).json({ error: 'Session not found' });
+  }
+});
+
+// Get blocked time ranges for a given date (frontend calls this to disable slots)
+// Returns: { blockedSlots: ["10:00 AM", "10:30 AM", ...], ranges: [{start, end, service}] }
+app.get('/api/booked-times/:date', (req, res) => {
+  try {
+    const { date } = req.params;
+
+    // Validate date format (YYYY-MM-DD)
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD.' });
+    }
+
+    const bookings = db.prepare(
+      'SELECT start_minutes, end_minutes, start_time, service FROM bookings WHERE booking_date = ? ORDER BY start_minutes'
+    ).all(date);
+
+    // Build a list of every 30-min slot that falls within a blocked range
+    const blockedSlots = new Set();
+    const ranges = [];
+
+    for (const b of bookings) {
+      ranges.push({
+        start: minutesToTimeStr(b.start_minutes),
+        end: minutesToTimeStr(b.end_minutes),
+        service: b.service
+      });
+
+      // Mark every 30-minute slot that overlaps this booking as blocked
+      // Slots run from the booking start through the end of the blocked window
+      for (let m = b.start_minutes; m < b.end_minutes; m += 30) {
+        blockedSlots.add(minutesToTimeStr(m));
+      }
+    }
+
+    res.json({ blockedSlots: [...blockedSlots], ranges });
+  } catch (error) {
+    console.error('Error fetching booked times:', error.message);
+    res.status(500).json({ error: 'Failed to fetch booked times.' });
   }
 });
 
