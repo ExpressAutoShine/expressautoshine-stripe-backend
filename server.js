@@ -1,3 +1,4 @@
+
 // ============================================
 // ExpressAutoShine — Stripe Checkout Backend
 // ============================================
@@ -14,7 +15,7 @@
 // 5. After payment, customer is redirected back to your site
 // 6. Stripe sends a webhook → server emails booking details to owner
 // ============================================
-
+ 
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -22,20 +23,20 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const { Resend } = require('resend');
 const Database = require('better-sqlite3');
 const path = require('path');
-
+ 
 const resend = new Resend(process.env.RESEND_API_KEY);
-
+ 
 const app = express();
 const PORT = process.env.PORT || 3001;
-
+ 
 // ===== SQLITE DATABASE SETUP =====
 // DB_PATH env var lets you point to a Render persistent disk (e.g. /var/data/bookings.db)
 const dbPath = process.env.DB_PATH || path.join(__dirname, 'bookings.db');
 const db = new Database(dbPath);
-
+ 
 // Enable WAL mode for better concurrent read performance
 db.pragma('journal_mode = WAL');
-
+ 
 db.exec(`
   CREATE TABLE IF NOT EXISTS bookings (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,30 +62,30 @@ db.exec(`
     created_at      TEXT DEFAULT (datetime('now'))
   )
 `);
-
+ 
 // Index for fast availability lookups
 db.exec(`
   CREATE INDEX IF NOT EXISTS idx_bookings_date_time
   ON bookings (booking_date, start_minutes, end_minutes)
 `);
-
+ 
 // ===== STRIPE WEBHOOK (must be BEFORE express.json() middleware) =====
 // Stripe requires the raw body to verify webhook signatures
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
-
+ 
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
     console.error('Webhook signature verification failed:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
-
+ 
   // Handle successful payment
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
-
+ 
     // Only send emails if payment was actually received
     if (session.payment_status === 'paid') {
       // Send owner notification (you)
@@ -95,7 +96,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         // Log the error but don't fail the webhook — payment already succeeded
         console.error('Failed to send owner notification email:', emailErr.message);
       }
-
+ 
       // Send customer confirmation
       try {
         await sendCustomerConfirmation(session);
@@ -103,18 +104,18 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
       } catch (emailErr) {
         console.error('Failed to send customer confirmation email:', emailErr.message);
       }
-
+ 
       // Save booking and block the time slot (race-condition-safe)
       try {
         const m = session.metadata || {};
         const startMin = parseTimeToMinutes(m.time);
-
+ 
         if (startMin !== null && m.date) {
           const addonNames = m.addons ? m.addons.split(', ').filter(a => a.trim()) : [];
           const { endMinutes, durationMinutes } = calculateBlockedEndMinutes(
             startMin, m.svcKey || '', m.pkgKey || '', m.sizeKey || '', addonNames
           );
-
+ 
           const result = insertBookingIfAvailable({
             booking_date: m.date,
             start_time: m.time,
@@ -136,7 +137,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
             stripe_session_id: session.id,
             stripe_payment_intent: session.payment_intent || ''
           });
-
+ 
           if (result.success) {
             console.log(`Booking saved: ${m.date} ${m.time} — blocked until ${minutesToTimeStr(endMinutes)}`);
           } else {
@@ -168,22 +169,22 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
       }
     }
   }
-
+ 
   res.json({ received: true });
 });
-
+ 
 // ===== MIDDLEWARE =====
 app.use(express.json());
 app.use(cors({
   origin: process.env.FRONTEND_URL || '*',
   methods: ['POST', 'GET']
 }));
-
+ 
 // ===== OWNER EMAIL NOTIFICATION =====
 async function sendOwnerNotification(session) {
   const m = session.metadata || {};
   const totalPaid = (session.amount_total / 100).toFixed(2);
-
+ 
   const htmlBody = `
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
       <h2 style="background: #1a1a2e; color: #f5c518; padding: 20px; border-radius: 8px 8px 0 0; margin: 0;">
@@ -197,7 +198,7 @@ async function sendOwnerNotification(session) {
           <tr><td style="padding: 6px 0; font-weight: bold;">Email:</td><td><a href="mailto:${m.email || ''}">${m.email || 'N/A'}</a></td></tr>
           <tr><td style="padding: 6px 0; font-weight: bold;">Address:</td><td>${m.address || 'N/A'}</td></tr>
         </table>
-
+ 
         <h3 style="color: #1a1a2e; border-bottom: 2px solid #f5c518; padding-bottom: 8px; margin-top: 20px;">Booking Details</h3>
         <table style="width: 100%; border-collapse: collapse;">
           <tr><td style="padding: 6px 0; font-weight: bold; width: 140px;">Service:</td><td>${m.service || 'N/A'}</td></tr>
@@ -208,7 +209,7 @@ async function sendOwnerNotification(session) {
           <tr><td style="padding: 6px 0; font-weight: bold;">Water/Elec:</td><td>${m.waterElec || 'N/A'}</td></tr>
           <tr><td style="padding: 6px 0; font-weight: bold;">Add-ons:</td><td>${m.addons || 'None'}</td></tr>
         </table>
-
+ 
         <h3 style="color: #1a1a2e; border-bottom: 2px solid #f5c518; padding-bottom: 8px; margin-top: 20px;">Payment</h3>
         <table style="width: 100%; border-collapse: collapse;">
           <tr><td style="padding: 6px 0; font-weight: bold; width: 140px;">Total Paid:</td><td style="font-size: 18px; color: #2e7d32; font-weight: bold;">$${totalPaid} CAD</td></tr>
@@ -218,7 +219,7 @@ async function sendOwnerNotification(session) {
       </div>
     </div>
   `;
-
+ 
   await resend.emails.send({
     from: 'ExpressAutoShine <bookings@expressautoshine.ca>',
     to: ['Info@expressautoshine.com'],
@@ -226,36 +227,36 @@ async function sendOwnerNotification(session) {
     html: htmlBody
   });
 }
-
+ 
 // ===== CUSTOMER CONFIRMATION EMAIL =====
 async function sendCustomerConfirmation(session) {
   const m = session.metadata || {};
   const totalPaid = (session.amount_total / 100).toFixed(2);
   const customerEmail = m.email || session.customer_email;
-
+ 
   if (!customerEmail) {
     console.error('No customer email found — skipping confirmation email');
     return;
   }
-
+ 
   const addonsDisplay = m.addons && m.addons.trim() !== ''
     ? m.addons.split(', ').map(a => `<li style="padding: 3px 0;">${a}</li>`).join('')
     : '<li style="padding: 3px 0; color: #888;">None</li>';
-
+ 
   const htmlBody = `
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #ffffff;">
       <div style="background: #1a1a2e; padding: 30px 20px; border-radius: 8px 8px 0 0; text-align: center;">
         <h1 style="color: #f5c518; margin: 0; font-size: 24px;">ExpressAutoShine</h1>
         <p style="color: #cccccc; margin: 8px 0 0; font-size: 14px;">Premium Mobile Detailing</p>
       </div>
-
+ 
       <div style="border: 1px solid #e0e0e0; border-top: none; padding: 30px 20px; border-radius: 0 0 8px 8px;">
         <h2 style="color: #1a1a2e; margin-top: 0;">Booking Confirmed!</h2>
         <p style="color: #333; line-height: 1.6;">
           Hi ${m.firstName || 'there'},<br><br>
           Thank you for booking with ExpressAutoShine! Your payment has been received and your appointment is confirmed. Here are your booking details:
         </p>
-
+ 
         <div style="background: #f8f9fa; border-radius: 8px; padding: 20px; margin: 20px 0;">
           <h3 style="color: #1a1a2e; margin-top: 0; border-bottom: 2px solid #f5c518; padding-bottom: 8px;">Your Appointment</h3>
           <table style="width: 100%; border-collapse: collapse;">
@@ -266,24 +267,24 @@ async function sendCustomerConfirmation(session) {
             <tr><td style="padding: 8px 0; font-weight: bold; color: #555;">Address:</td><td style="color: #1a1a2e;">${m.address || 'N/A'}</td></tr>
           </table>
         </div>
-
+ 
         <div style="background: #f8f9fa; border-radius: 8px; padding: 20px; margin: 20px 0;">
           <h3 style="color: #1a1a2e; margin-top: 0; border-bottom: 2px solid #f5c518; padding-bottom: 8px;">Add-ons</h3>
           <ul style="margin: 0; padding-left: 20px; color: #1a1a2e;">${addonsDisplay}</ul>
         </div>
-
+ 
         <div style="background: #e8f5e9; border-radius: 8px; padding: 20px; margin: 20px 0; text-align: center;">
           <p style="margin: 0; color: #555; font-size: 14px;">Total Paid</p>
           <p style="margin: 5px 0 0; color: #2e7d32; font-size: 28px; font-weight: bold;">$${totalPaid} CAD</p>
           <p style="margin: 5px 0 0; color: #2e7d32; font-size: 14px;">Payment Confirmed</p>
         </div>
-
+ 
         <div style="background: #fff8e1; border-radius: 8px; padding: 15px 20px; margin: 20px 0;">
           <p style="margin: 0; color: #555; font-size: 14px;">
             <strong>What to expect:</strong> Our team will arrive at your location on the scheduled date and time with all equipment needed. Please ensure the vehicle is accessible.
           </p>
         </div>
-
+ 
         <hr style="border: none; border-top: 1px solid #e0e0e0; margin: 25px 0;">
         <p style="color: #888; font-size: 13px; text-align: center; line-height: 1.5;">
           Questions? Contact us at <a href="tel:514-946-6186" style="color: #1a1a2e;">514-946-6186</a>
@@ -293,7 +294,7 @@ async function sendCustomerConfirmation(session) {
       </div>
     </div>
   `;
-
+ 
   await resend.emails.send({
     from: 'ExpressAutoShine <bookings@expressautoshine.ca>',
     to: [customerEmail],
@@ -301,7 +302,7 @@ async function sendCustomerConfirmation(session) {
     html: htmlBody
   });
 }
-
+ 
 // ===== PRICING DATA (must match your frontend exactly) =====
 // This is the "source of truth" — the frontend total is NEVER trusted
 const PRICES = {
@@ -311,7 +312,7 @@ const PRICES = {
   correction: { enhancement: { sedan: 309, suv: 359, truck: 409 }, correction: { sedan: 549, suv: 649, truck: 749 } },
   ceramic: { '1year': { sedan: 449, suv: 549, truck: 649 }, '3year': { sedan: 899, suv: 1049, truck: 1199 }, '8year': { sedan: 1399, suv: 1599, truck: 1799 } }
 };
-
+ 
 // Add-on prices (for server-side validation)
 const ADDON_PRICES = {
   'Engine Bay Detail': 40, 'Windshield Water Repellent': 45, 'Tree Sap Removal': 65,
@@ -320,11 +321,11 @@ const ADDON_PRICES = {
   'Interior Protection Package': 350, 'Interior Refresh Detail': 125,
   'Glass Ceramic Coating': 200, 'Wheel Ceramic Coating': 200, 'Glass Coating': 200
 };
-
+ 
 // Quebec taxes
 const GST = 0.05;
 const QST = 0.09975;
-
+ 
 // ===== SERVICE DURATIONS (estimated minutes per service/package/size) =====
 // Adjust these if real job times differ — they control schedule blocking
 const SERVICE_DURATIONS = {
@@ -334,7 +335,7 @@ const SERVICE_DURATIONS = {
   correction:  { enhancement: { sedan: 180, suv: 210, truck: 240 }, correction:  { sedan: 300, suv: 360, truck: 420 } },
   ceramic:     { '1year':     { sedan: 240, suv: 270, truck: 300 }, '3year':     { sedan: 300, suv: 360, truck: 420 }, '8year': { sedan: 360, suv: 420, truck: 480 } }
 };
-
+ 
 // Add-on durations (estimated additional minutes per add-on)
 const ADDON_DURATIONS = {
   'Engine Bay Detail': 30, 'Windshield Water Repellent': 15, 'Tree Sap Removal': 30,
@@ -343,9 +344,9 @@ const ADDON_DURATIONS = {
   'Interior Protection Package': 60, 'Interior Refresh Detail': 45,
   'Glass Ceramic Coating': 45, 'Wheel Ceramic Coating': 45, 'Glass Coating': 30
 };
-
+ 
 // ===== TIME HELPER FUNCTIONS =====
-
+ 
 // "10:00 AM" → 600, "2:30 PM" → 870
 function parseTimeToMinutes(timeStr) {
   const match = timeStr.match(/(\d+):(\d+)\s*(AM|PM)/i);
@@ -357,7 +358,7 @@ function parseTimeToMinutes(timeStr) {
   if (period === 'AM' && hours === 12) hours = 0;
   return hours * 60 + minutes;
 }
-
+ 
 // 870 → "2:30 PM"
 function minutesToTimeStr(mins) {
   let h = Math.floor(mins / 60);
@@ -367,7 +368,7 @@ function minutesToTimeStr(mins) {
   if (h === 0) h = 12;
   return `${h}:${String(m).padStart(2, '0')} ${period}`;
 }
-
+ 
 // Calculate total service time, then round UP to nearest 30min, then add 60min buffer
 function calculateBlockedEndMinutes(startMinutes, svcKey, pkgKey, sizeKey, addonNames) {
   // Base service duration
@@ -375,36 +376,36 @@ function calculateBlockedEndMinutes(startMinutes, svcKey, pkgKey, sizeKey, addon
   if (SERVICE_DURATIONS[svcKey] && SERVICE_DURATIONS[svcKey][pkgKey] && SERVICE_DURATIONS[svcKey][pkgKey][sizeKey]) {
     totalMin = SERVICE_DURATIONS[svcKey][pkgKey][sizeKey];
   }
-
+ 
   // Add add-on durations
   if (addonNames && addonNames.length > 0) {
     for (const name of addonNames) {
       totalMin += ADDON_DURATIONS[name] || 0;
     }
   }
-
+ 
   // Round UP to nearest 30-minute slot
   const rounded = Math.ceil(totalMin / 30) * 30;
-
+ 
   // Add 1-hour (60 min) buffer
   const blocked = rounded + 60;
-
+ 
   return { endMinutes: startMinutes + blocked, durationMinutes: totalMin };
 }
-
+ 
 // ===== BOOKING DATABASE HELPERS =====
-
+ 
 // Race-condition-safe: runs inside a SQLite transaction (serialized writes)
 const insertBookingIfAvailable = db.transaction((data) => {
   // Check for overlapping bookings on the same date
   const conflict = db.prepare(
     'SELECT id, start_time FROM bookings WHERE booking_date = ? AND start_minutes < ? AND end_minutes > ?'
   ).get(data.booking_date, data.end_minutes, data.start_minutes);
-
+ 
   if (conflict) {
     return { success: false, conflict };
   }
-
+ 
   db.prepare(`
     INSERT INTO bookings (
       booking_date, start_time, start_minutes, end_minutes, duration_minutes,
@@ -418,33 +419,33 @@ const insertBookingIfAvailable = db.transaction((data) => {
     data.address, data.service, data.svc_key, data.pkg_key, data.size_key, data.vehicle, data.addons,
     data.total_paid_cents, data.stripe_session_id, data.stripe_payment_intent
   );
-
+ 
   return { success: true };
 });
-
+ 
 // ===== ROUTES =====
-
+ 
 // Health check
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'ExpressAutoShine Stripe Backend' });
 });
-
+ 
 // Create Stripe Checkout Session
 app.post('/create-checkout-session', async (req, res) => {
   try {
     const { service, pkgKey, svcKey, sizeKey, addons, date, time,
             address, vehicle, dirty, waterElec,
             firstName, lastName, email, phone } = req.body;
-
+ 
     // ===== SERVER-SIDE PRICE CALCULATION (never trust the frontend) =====
-
+ 
     // Validate service and size exist
     if (!PRICES[svcKey] || !PRICES[svcKey][pkgKey] || !PRICES[svcKey][pkgKey][sizeKey]) {
       return res.status(400).json({ error: 'Invalid service, package, or vehicle size' });
     }
-
+ 
     const packagePrice = PRICES[svcKey][pkgKey][sizeKey];
-
+ 
     // Calculate add-on total (validate each add-on price server-side)
     let addonTotal = 0;
     const validatedAddons = [];
@@ -457,15 +458,15 @@ app.post('/create-checkout-session', async (req, res) => {
         }
       }
     }
-
+ 
     const subtotal = packagePrice + addonTotal;
     const gst = subtotal * GST;
     const qst = subtotal * QST;
     const total = subtotal + gst + qst;
-
+ 
     // Convert to cents for Stripe (Stripe uses smallest currency unit)
     const totalCents = Math.round(total * 100);
-
+ 
     // ===== BUILD LINE ITEMS FOR STRIPE =====
     const lineItems = [
       {
@@ -480,7 +481,7 @@ app.post('/create-checkout-session', async (req, res) => {
         quantity: 1
       }
     ];
-
+ 
     // Add each add-on as a separate line item
     validatedAddons.forEach(addon => {
       lineItems.push({
@@ -492,7 +493,7 @@ app.post('/create-checkout-session', async (req, res) => {
         quantity: 1
       });
     });
-
+ 
     // ===== CREATE STRIPE CHECKOUT SESSION =====
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
@@ -519,20 +520,20 @@ app.post('/create-checkout-session', async (req, res) => {
       success_url: `${process.env.FRONTEND_URL}/success.html?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${process.env.FRONTEND_URL}/expressautoshine_v4.html`
     });
-
+ 
     // Add tax line items
     // Note: If you enable Stripe Tax, remove these manual tax items
     // For now, we handle taxes by adjusting the total
     // Stripe Checkout will show the items with their prices
-
+ 
     res.json({ url: session.url, sessionId: session.id });
-
+ 
   } catch (error) {
     console.error('Stripe error:', error.message);
     res.status(500).json({ error: 'Payment session creation failed. Please try again.' });
   }
 });
-
+ 
 // Retrieve session details (for success page)
 app.get('/session/:id', async (req, res) => {
   try {
@@ -547,50 +548,40 @@ app.get('/session/:id', async (req, res) => {
     res.status(404).json({ error: 'Session not found' });
   }
 });
-
-// Get blocked time ranges for a given date (frontend calls this to disable slots)
-// Returns: { blockedSlots: ["10:00 AM", "10:30 AM", ...], ranges: [{start, end, service}] }
+ 
+// Get booked time ranges for a given date (frontend uses for smart slot filtering)
 app.get('/api/booked-times/:date', (req, res) => {
   try {
     const { date } = req.params;
-
+ 
     // Validate date format (YYYY-MM-DD)
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
       return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD.' });
     }
-
+ 
     const bookings = db.prepare(
       'SELECT start_minutes, end_minutes, start_time, service FROM bookings WHERE booking_date = ? ORDER BY start_minutes'
     ).all(date);
-
-    // Build a list of every 30-min slot that falls within a blocked range
-    const blockedSlots = new Set();
-    const ranges = [];
-
-    for (const b of bookings) {
-      ranges.push({
-        start: minutesToTimeStr(b.start_minutes),
-        end: minutesToTimeStr(b.end_minutes),
-        service: b.service
-      });
-
-      // Mark every 30-minute slot that overlaps this booking as blocked
-      // Slots run from the booking start through the end of the blocked window
-      for (let m = b.start_minutes; m < b.end_minutes; m += 30) {
-        blockedSlots.add(minutesToTimeStr(m));
-      }
-    }
-
-    res.json({ blockedSlots: [...blockedSlots], ranges });
+ 
+    const ranges = bookings.map(b => ({
+      startMin: b.start_minutes,
+      endMin: b.end_minutes,
+      start: minutesToTimeStr(b.start_minutes),
+      end: minutesToTimeStr(b.end_minutes),
+      service: b.service
+    }));
+ 
+    res.json({ ranges });
   } catch (error) {
     console.error('Error fetching booked times:', error.message);
     res.status(500).json({ error: 'Failed to fetch booked times.' });
   }
 });
-
+ 
 // ===== START SERVER =====
 app.listen(PORT, () => {
   console.log(`\n🚀 ExpressAutoShine Stripe Backend running on port ${PORT}`);
   console.log(`   Health check: http://localhost:${PORT}/`);
   console.log(`   Checkout endpoint: POST http://localhost:${PORT}/create-checkout-session\n`);
 });
+ 
