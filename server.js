@@ -1,4 +1,3 @@
-
 // ============================================
 // ExpressAutoShine — Stripe Checkout Backend
 // ============================================
@@ -212,9 +211,9 @@ async function sendOwnerNotification(session) {
  
         <h3 style="color: #1a1a2e; border-bottom: 2px solid #f5c518; padding-bottom: 8px; margin-top: 20px;">Payment</h3>
         <table style="width: 100%; border-collapse: collapse;">
-          <tr><td style="padding: 6px 0; font-weight: bold; width: 140px;">Total Paid:</td><td style="font-size: 18px; color: #2e7d32; font-weight: bold;">$${totalPaid} CAD</td></tr>
-          <tr><td style="padding: 6px 0; font-weight: bold;">Payment Status:</td><td style="color: #2e7d32;">✅ Paid</td></tr>
-          <tr><td style="padding: 6px 0; font-weight: bold;">Stripe Session:</td><td style="font-size: 12px; color: #888;">${session.id}</td></tr>
+          <tr><td style="padding: 6px 0; font-weight: bold; width: 140px;">Total${m.payMethod === 'cash' ? ' Due' : ' Paid'}:</td><td style="font-size: 18px; color: #2e7d32; font-weight: bold;">$${totalPaid} CAD</td></tr>
+          <tr><td style="padding: 6px 0; font-weight: bold;">Payment Method:</td><td style="color: ${m.payMethod === 'cash' ? '#e65100' : '#2e7d32'};">${m.payMethod === 'cash' ? '💵 Cash on Arrival' : '✅ Paid Online'}</td></tr>
+          <tr><td style="padding: 6px 0; font-weight: bold;">Booking ID:</td><td style="font-size: 12px; color: #888;">${session.id}</td></tr>
         </table>
       </div>
     </div>
@@ -254,7 +253,7 @@ async function sendCustomerConfirmation(session) {
         <h2 style="color: #1a1a2e; margin-top: 0;">Booking Confirmed!</h2>
         <p style="color: #333; line-height: 1.6;">
           Hi ${m.firstName || 'there'},<br><br>
-          Thank you for booking with ExpressAutoShine! Your payment has been received and your appointment is confirmed. Here are your booking details:
+          Thank you for booking with ExpressAutoShine! ${m.payMethod === 'cash' ? 'Your appointment is confirmed. Please have the full amount ready in cash when our team arrives.' : 'Your payment has been received and your appointment is confirmed.'} Here are your booking details:
         </p>
  
         <div style="background: #f8f9fa; border-radius: 8px; padding: 20px; margin: 20px 0;">
@@ -273,10 +272,10 @@ async function sendCustomerConfirmation(session) {
           <ul style="margin: 0; padding-left: 20px; color: #1a1a2e;">${addonsDisplay}</ul>
         </div>
  
-        <div style="background: #e8f5e9; border-radius: 8px; padding: 20px; margin: 20px 0; text-align: center;">
-          <p style="margin: 0; color: #555; font-size: 14px;">Total Paid</p>
-          <p style="margin: 5px 0 0; color: #2e7d32; font-size: 28px; font-weight: bold;">$${totalPaid} CAD</p>
-          <p style="margin: 5px 0 0; color: #2e7d32; font-size: 14px;">Payment Confirmed</p>
+        <div style="background: ${m.payMethod === 'cash' ? '#fff8e1' : '#e8f5e9'}; border-radius: 8px; padding: 20px; margin: 20px 0; text-align: center;">
+          <p style="margin: 0; color: #555; font-size: 14px;">${m.payMethod === 'cash' ? 'Total Due (Cash)' : 'Total Paid'}</p>
+          <p style="margin: 5px 0 0; color: ${m.payMethod === 'cash' ? '#e65100' : '#2e7d32'}; font-size: 28px; font-weight: bold;">$${totalPaid} CAD</p>
+          <p style="margin: 5px 0 0; color: ${m.payMethod === 'cash' ? '#e65100' : '#2e7d32'}; font-size: 14px;">${m.payMethod === 'cash' ? 'Pay Cash on Arrival' : 'Payment Confirmed'}</p>
         </div>
  
         <div style="background: #fff8e1; border-radius: 8px; padding: 15px 20px; margin: 20px 0;">
@@ -546,6 +545,104 @@ app.get('/session/:id', async (req, res) => {
     });
   } catch (error) {
     res.status(404).json({ error: 'Session not found' });
+  }
+});
+ 
+// ===== CASH BOOKING ENDPOINT =====
+// Same logic as webhook: save booking, block slot, send emails — but no Stripe payment
+app.post('/cash-booking', async (req, res) => {
+  try {
+    const {
+      service, pkgKey, svcKey, sizeKey, addons, date, time,
+      address, vehicle, dirty, waterElec,
+      firstName, lastName, email, phone, total
+    } = req.body;
+ 
+    // Basic validation
+    if (!date || !time || !firstName || !email || !service) {
+      return res.status(400).json({ error: 'Missing required booking fields.' });
+    }
+ 
+    // --- Save booking (race-condition-safe, same as webhook) ---
+    const startMin = parseTimeToMinutes(time);
+    if (startMin === null) {
+      return res.status(400).json({ error: 'Invalid time format.' });
+    }
+ 
+    const addonNames = addons ? addons.map(a => a.n || a).filter(a => a) : [];
+    const addonStr = addonNames.join(', ');
+    const { endMinutes, durationMinutes } = calculateBlockedEndMinutes(
+      startMin, svcKey || '', pkgKey || '', sizeKey || '', addonNames
+    );
+ 
+    const result = insertBookingIfAvailable({
+      booking_date: date,
+      start_time: time,
+      start_minutes: startMin,
+      end_minutes: endMinutes,
+      duration_minutes: durationMinutes,
+      customer_first: firstName || '',
+      customer_last: lastName || '',
+      customer_email: email || '',
+      customer_phone: phone || '',
+      address: address || '',
+      service: service || '',
+      svc_key: svcKey || '',
+      pkg_key: pkgKey || '',
+      size_key: sizeKey || '',
+      vehicle: vehicle || '',
+      addons: addonStr,
+      total_paid_cents: Math.round((total || 0) * 100),
+      stripe_session_id: 'CASH-' + Date.now(),
+      stripe_payment_intent: ''
+    });
+ 
+    if (!result.success) {
+      console.error(`CASH BOOKING CONFLICT: ${date} ${time}`);
+      return res.status(409).json({ error: 'This time slot is no longer available. Please choose a different time.' });
+    }
+ 
+    console.log(`Cash booking saved: ${date} ${time} — blocked until ${minutesToTimeStr(endMinutes)}`);
+ 
+    // --- Build a session-like object so existing email functions work unchanged ---
+    const fakeSess = {
+      id: 'CASH-' + Date.now(),
+      amount_total: Math.round((total || 0) * 100),
+      payment_intent: null,
+      customer_email: email,
+      metadata: {
+        firstName, lastName, phone, email,
+        svcKey: svcKey || '', pkgKey: pkgKey || '', sizeKey: sizeKey || '',
+        service: service || '', vehicle: vehicle || '',
+        date: date || '', time: time || '',
+        address: address || '',
+        dirty: String(dirty || ''), waterElec: waterElec || '',
+        addons: addonStr,
+        payMethod: 'cash'
+      }
+    };
+ 
+    // --- Send owner notification ---
+    try {
+      await sendOwnerNotification(fakeSess);
+      console.log('Owner notification sent for cash booking');
+    } catch (emailErr) {
+      console.error('Failed to send owner notification for cash booking:', emailErr.message);
+    }
+ 
+    // --- Send customer confirmation ---
+    try {
+      await sendCustomerConfirmation(fakeSess);
+      console.log('Customer confirmation sent for cash booking');
+    } catch (emailErr) {
+      console.error('Failed to send customer confirmation for cash booking:', emailErr.message);
+    }
+ 
+    res.json({ success: true, message: 'Booking confirmed.' });
+ 
+  } catch (error) {
+    console.error('Cash booking error:', error.message);
+    res.status(500).json({ error: 'Failed to create booking. Please try again or call 514-946-6186.' });
   }
 });
  
