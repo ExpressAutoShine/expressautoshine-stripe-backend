@@ -430,11 +430,26 @@ app.get('/', (req, res) => {
 });
  
 // Create Stripe Checkout Session
+// ===== 24-HOUR NOTICE VALIDATION (reused by both endpoints) =====
+function validateBookingDate(dateStr) {
+  if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return 'Invalid date format.';
+  const parts = dateStr.split('-').map(Number);
+  const bookingDate = new Date(parts[0], parts[1] - 1, parts[2]);
+  const now = new Date();
+  const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+  if (bookingDate < tomorrow) return 'Bookings require at least 24 hours notice. Please choose a future date.';
+  return null; // valid
+}
+ 
 app.post('/create-checkout-session', async (req, res) => {
   try {
     const { service, pkgKey, svcKey, sizeKey, addons, date, time,
             address, vehicle, dirty, waterElec,
             firstName, lastName, email, phone } = req.body;
+ 
+    // ===== 24-HOUR NOTICE CHECK =====
+    const dateError = validateBookingDate(date);
+    if (dateError) return res.status(400).json({ error: dateError });
  
     // ===== SERVER-SIDE PRICE CALCULATION (never trust the frontend) =====
  
@@ -557,6 +572,10 @@ app.post('/cash-booking', async (req, res) => {
       address, vehicle, dirty, waterElec,
       firstName, lastName, email, phone, total
     } = req.body;
+ 
+    // 24-hour notice check
+    const dateError = validateBookingDate(date);
+    if (dateError) return res.status(400).json({ error: dateError });
  
     // Basic validation
     if (!date || !time || !firstName || !email || !service) {
