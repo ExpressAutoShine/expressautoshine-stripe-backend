@@ -431,13 +431,23 @@ app.get('/', (req, res) => {
  
 // Create Stripe Checkout Session
 // ===== 24-HOUR NOTICE VALIDATION (reused by both endpoints) =====
-function validateBookingDate(dateStr) {
+function validateBookingDate(dateStr, timeStr) {
   if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return 'Invalid date format.';
   const parts = dateStr.split('-').map(Number);
   const bookingDate = new Date(parts[0], parts[1] - 1, parts[2]);
   const now = new Date();
   const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
   if (bookingDate < tomorrow) return 'Bookings require at least 24 hours notice. Please choose a future date.';
+  // If time is provided, check exact 24-hour gap
+  if (timeStr) {
+    const tm = parseTimeToMinutes(timeStr);
+    if (tm !== null) {
+      const slotDate = new Date(parts[0], parts[1] - 1, parts[2], Math.floor(tm / 60), tm % 60, 0);
+      if (slotDate.getTime() - now.getTime() < 86400000) {
+        return 'This time slot is less than 24 hours away. Please choose a later time or date.';
+      }
+    }
+  }
   return null; // valid
 }
  
@@ -448,7 +458,7 @@ app.post('/create-checkout-session', async (req, res) => {
             firstName, lastName, email, phone } = req.body;
  
     // ===== 24-HOUR NOTICE CHECK =====
-    const dateError = validateBookingDate(date);
+    const dateError = validateBookingDate(date, time);
     if (dateError) return res.status(400).json({ error: dateError });
  
     // ===== SERVER-SIDE PRICE CALCULATION (never trust the frontend) =====
@@ -574,7 +584,7 @@ app.post('/cash-booking', async (req, res) => {
     } = req.body;
  
     // 24-hour notice check
-    const dateError = validateBookingDate(date);
+    const dateError = validateBookingDate(date, time);
     if (dateError) return res.status(400).json({ error: dateError });
  
     // Basic validation
