@@ -25,6 +25,17 @@ const path = require('path');
  
 const resend = new Resend(process.env.RESEND_API_KEY);
  
+// ===== TWILIO (SMS reminders) =====
+const twilioEnabled = !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_PHONE_NUMBER);
+let twilioClient = null;
+if (twilioEnabled) {
+  const twilio = require('twilio');
+  twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+  console.log('Twilio SMS reminders enabled');
+} else {
+  console.log('Twilio SMS reminders disabled (missing env vars)');
+}
+ 
 const app = express();
 const PORT = process.env.PORT || 3001;
  
@@ -67,6 +78,14 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_bookings_date_time
   ON bookings (booking_date, start_minutes, end_minutes)
 `);
+ 
+// Add reminder_sent column if it doesn't exist (safe migration for existing databases)
+try {
+  db.exec(`ALTER TABLE bookings ADD COLUMN reminder_sent INTEGER DEFAULT 0`);
+  console.log('Added reminder_sent column to bookings table');
+} catch (e) {
+  // Column already exists — ignore
+}
  
 // ===== STRIPE WEBHOOK (must be BEFORE express.json() middleware) =====
 // Stripe requires the raw body to verify webhook signatures
@@ -703,6 +722,83 @@ app.get('/api/booked-times/:date', (req, res) => {
     res.status(500).json({ error: 'Failed to fetch booked times.' });
   }
 });
+ 
+// ===== 24-HOUR SMS REMINDER SCHEDULER =====
+// Runs every 15 minutes. Finds bookings 22–26 hours away that haven't been reminded.
+// Window is wider than exact 24h to handle edge cases (server restarts, etc.)
+function checkAndSendReminders() {
+  if (!twilioEnabled || !twilioClient) return;
+ 
+  try {
+    const now = new Date();
+ 
+    // Look ahead window: bookings between 22 and 26 hours from now
+    const minAhead = new Date(now.getTime() + 22 * 60 * 60 * 1000);
+    const maxAhead = new Date(now.getTime() + 26 * 60 * 60 * 1000);
+ 
+    // Build date strings for the range (could span two calendar days)
+    const dates = new Set();
+    dates.add(minAhead.getFullYear() + '-' + String(minAhead.getMonth() + 1).padStart(2, '0') + '-' + String(minAhead.getDate()).padStart(2, '0'));
+    dates.add(maxAhead.getFullYear() + '-' + String(maxAhead.getMonth() + 1).padStart(2, '0') + '-' + String(maxAhead.getDate()).padStart(2, '0'));
+ 
+    const dateList = [...dates];
+    const placeholders = dateList.map(() => '?').join(',');
+ 
+    const bookings = db.prepare(
+      `SELECT id, booking_date, start_time, start_minutes, customer_first, customer_phone, service
+       FROM bookings
+       WHERE booking_date IN (${placeholders})
+         AND reminder_sent = 0
+         AND customer_phone IS NOT NULL
+         AND customer_phone != ''`
+    ).all(...dateList);
+ 
+    for (const b of bookings) {
+      // Calculate exact appointment datetime
+      const dp = b.booking_date.split('-').map(Number);
+      const apptDate = new Date(dp[0], dp[1] - 1, dp[2], Math.floor(b.start_minutes / 60), b.start_minutes % 60, 0);
+      const hoursUntil = (apptDate.getTime() - now.getTime()) / (60 * 60 * 1000);
+ 
+      // Only send if within 22–26 hour window
+      if (hoursUntil < 22 || hoursUntil > 26) continue;
+ 
+      // Clean phone number: keep digits only, ensure +1 prefix for North America
+      let phone = b.customer_phone.replace(/[^\d+]/g, '');
+      if (phone.length === 10) phone = '+1' + phone;
+      else if (phone.length === 11 && phone.startsWith('1')) phone = '+' + phone;
+      else if (!phone.startsWith('+')) phone = '+1' + phone;
+ 
+      // Skip obviously invalid numbers
+      if (phone.length < 11) {
+        console.log(`Skipping reminder for booking #${b.id} — phone too short: ${b.customer_phone}`);
+        continue;
+      }
+ 
+      const name = b.customer_first || 'there';
+      const msg = `Hi ${name}! This is a reminder from ExpressAutoShine that your ${b.service || 'detailing'} appointment is tomorrow, ${b.booking_date} at ${b.start_time}. Please ensure your vehicle is accessible. Questions? Call 514-946-6186.`;
+ 
+      twilioClient.messages.create({
+        body: msg,
+        from: process.env.TWILIO_PHONE_NUMBER,
+        to: phone
+      }).then(() => {
+        db.prepare('UPDATE bookings SET reminder_sent = 1 WHERE id = ?').run(b.id);
+        console.log(`SMS reminder sent for booking #${b.id}: ${b.booking_date} ${b.start_time} → ${phone}`);
+      }).catch((err) => {
+        console.error(`Failed to send SMS reminder for booking #${b.id}:`, err.message);
+        // Don't mark as sent — will retry next cycle
+      });
+    }
+  } catch (err) {
+    console.error('Reminder scheduler error:', err.message);
+  }
+}
+ 
+// Run every 15 minutes
+const REMINDER_INTERVAL = 15 * 60 * 1000;
+setInterval(checkAndSendReminders, REMINDER_INTERVAL);
+// Also run once 30 seconds after startup
+setTimeout(checkAndSendReminders, 30000);
  
 // ===== START SERVER =====
 app.listen(PORT, () => {
